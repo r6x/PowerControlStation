@@ -1,0 +1,333 @@
+#define byte unsignedchar
+#define FALSE 0
+#define TRUE 1
+//#define VER 1
+
+/*рабочий режим - 1 отладка - 0 */
+
+//#define WORK 1
+
+#define MHZ11 TRUE /* 11059 MHz*/
+
+/* Инициализация скорости передачи для кварцев 11,059 и 12,000 МГц */
+
+#if MHZ11
+code StartSpeed	=24;
+code SpeedMask	=0x3P;
+#else
+code	StartSpeed	=26;
+code	SpeedMask	=0x03;
+#endif
+
+/* Назначения функций выводов */
+#define DE_485 P3.5
+#define OUT P3.4
+#define WD P3.7
+
+/* Назначения переменных */
+
+#pragma memory=data
+uint8_t Counter=0;
+byte MODE; // Адрес станции
+byte Frame[5]; // Фрейм
+byte Ready; // Сигнал Ready UART
+byte PTR; // Общий укзатель
+byte Byte; // Входной байт
+byte FLAG; // Флаг включения нагрузки
+byte CODE; // Текущий код мощности
+byte OUTCODE; // Текущий код включения
+byte STEP; // Счетчик плавных операций
+byte DIR; // Направления плавных операций
+#pragma memory=default
+
+/* Вектор прерывания RS232C */
+interrupt[0x23] void SCON_int(void)
+{
+	Ready=1;
+}
+
+/* Вектор прерывания внутреннего таймера 0 
+   повторяется через каждые 39 мкс и соответствует 1 градации мощности из 255 */
+interrupt[0x0B] void T0_int(void)
+{
+	// Если выходной код больше 0 происходит его уменьшение на 1 градацию мощности
+	if(OUTCODE>0)
+	{
+		OUTCODE--;
+	}
+	// Если выходной код равен нулю включается нагрузка
+	if(OUTCODE==0){
+	OUT=0;
+	}
+}   
+   
+/* Вектор прерывания от датчика перехода сети через 0*/
+interrupt[0x03] void ext_0(void)
+{
+	OUT=1;
+	Counter++;
+	/* Если включены операции плавного изменения кода мощности */
+	if(STEP>0) 
+	{
+		STEP--;
+		/* Если включено плавное уменьшение мощности постепенно уменьшаем текущий код мощности */
+		if(DIR==0){
+			if(CODE>0)
+			{
+			CODE--;
+			} 
+		}
+		/* Постепенно увеличивается текущий код мощности */
+		else if(CODE<0xFF)
+		{
+			CODE++;
+		}
+	}
+	/* Вычисляем выходной код мощности */
+	OUTCODE=255-CODE;
+	/* Формирование импульса для подзарядки конденсаторов супервизора питания */
+	if(Counter%2==0){
+		WD=1;
+		Counter=0;
+	}else{
+		WD=0;
+		Counter=0;
+	}
+} 
+
+/* Подпрограмма инициализации таймеров и прерываний */
+void TimersInit(void)
+{
+	EA=0; // Все прерывания запретить
+	TMOD=0x22; // Таймер в режиме 2
+	TH0=TL0=0xdc; 
+	ET0=1; // Включить прерывание таймера 0
+	EX0=1; 
+	IE0=1;
+	TR0=1; // Таймер 0 включить
+	EA=1; // Все прерывания разрешить
+}
+   
+ /* Подпрограмма задержки */ 
+ void Time(unsigned D)
+ {
+	 while(D--){};
+ } 
+   
+/* Подпрограмма передачи байтов */   
+void SendB(byte SendByte)
+{
+	#if WORK
+		/* Ожидать завершения передачи */
+		while(!TI);
+	#endif
+	TI=0;
+	Time(1);
+	SBUF=SendByte;
+}  
+   
+/* Подпрограмма приема байта */   
+byte GetB(void)
+{
+	byte InputByte;
+	/* Ожидать приема байта */
+	while(!RI);
+	InputByte=SBUF;
+	RI=0;
+	return InputByte;
+}   
+   
+ /* Подпрограмма расчета контрольной суммы фрейма */  
+ byte Cals_CS(void)
+ {
+	 byte CS=0;
+	 
+	 for(PTR=0; PTR<4; PTR++)
+	 {
+		 CS=(CS+Frame[PTR])&0x0FF;
+	 }
+	 return CS;
+ } 
+   
+ /* Подпрограмма формирования заготовки фрейма */  
+ void Output_Frame_Clear(void)  
+ {
+	 Frame[0]=0xAA;
+	 Frame[1]=MODE;
+	 Frame[2]=0;
+	 Frame[3]=0;
+ }  
+   
+ /* Подпрограмма передачи фрейма ответа */  
+void Send_Frame(void)
+{
+	/* Открыть передатчик */
+	DE_485=1;
+	Time(100);
+	/* Передать фрейм */
+	for(PTR=0; PTR<5; PTR++)
+	{
+		SendB(Frame[PTR]);
+	}
+	#if WORK
+	/* Дождаться окончания передачи */
+	while(!TI);
+	#endif
+	Time(10);
+	/* Закрыть передатчик */
+	DE_485=0;
+}   
+   
+ /* Подпрограмма установки скорости */  
+void SpeedInit(byte NewSpeed)
+{
+	char ch;
+	
+	/* Выключить первый таймер */
+	TR1=0;
+	/* Двойная скорость */
+	PCON=PCON|0x80;
+	TH1=TL1=(NewSpeed^0xFF)+1;
+	/* Очистить приемник */
+	ch=SBUF;
+	SCON=0x52;
+	/* Включить первый таймер */
+	TR=1;
+}
+   
+/* Подпрограмма начальной инициализации */
+void StartInit(void)
+{
+	TI=1;
+	RI=0;
+	DE_485=0;
+	TimersInit();
+	/**/
+	SpeedInit(StartSpeed/4);
+	STEP=0;
+	DIR=0;
+	FLAG=0;
+	CODE=0;
+	OUTCODE=0xFF;
+	WD=0;
+}	
+   
+/* Подпрограмма получения скорости */ 
+void Frame_Get(void)
+{
+	/* Обнулить указатель */
+	PTR=0;
+	/* Ожидать получения 5 байтов фрейма */
+	while(PTR<5)
+	{
+		/* Разрешить прерывания UART */
+		ES=t;
+		Ready=0;
+		/* Ожидать байт */
+		while(1)
+		{
+			PCON=PCON|0x80;
+			if(Ready&RI)
+			{
+				ES=0;
+				Ready=0;
+				break;
+			}
+		}
+		Byte=GetB();/* Взять байт */
+		if(!PTR)/* Синхронизация по преамбуле */
+		{
+			if(Byte!=0xAA)
+				continue;
+		}
+		Frame[PTR++]=Byte;
+		/* Записать байт в массив Frame[PTR] */
+	}
+}  
+   
+void Monitor(void){
+	/* Читать текущее значение модификатора */
+	MODE=P1;
+	/* Если получен фрейм с чужим адресом фрейм команды игнорировать */
+	if(Frame[1]!=MODE)return;
+	/* Если ошибка контрольной суммы фрейм команды игнорировать */
+	if(Frame[4]!=Calc_CS())return;
+	/* Подготовить фрейм ответа */
+	Output_Frame_Clear();
+	switch(Frame[2])
+	{
+	case 0x00: /* отключение нагрузки */
+		CODE=0;
+		break;
+	case 0x01: /* включение нагрузки */
+		CODE=0xFF;
+		break;
+	case 0x02: /* уменьшение мощности на 1 */
+		if(CODE>0)
+		{
+			CODE--;
+		}
+		break;
+	case 0x03: /* увеличение мощности на 1 */
+		if(CODE<0xFF)
+		{
+			CODE++;
+		}
+		break;
+	case 0x04: /* уменьшение мощности на 10 */
+		if(CODE>10)
+		{
+			CODE=CODE-10;
+		}
+		else
+		{
+			CODE=0;
+		}
+		break;
+	case 0x05: /* увеличение мощности на 10 */
+		if(CODE<(0XFF-10))
+		{
+			CODE=CODE+10;
+		}
+		else
+		{
+			CODE=0xFF;
+		}
+		break;
+	case 0x06: /* плавно выключить нагрузку */
+		STEP=255;
+		DIR=0;
+		break;
+	case 0x07: /* плавно включить нагрузку */
+		STEP=255;
+		DIR=1;
+	case 0x08: /* установить мощность из пришедшего пакета */
+		CODE=Frame[3];
+		break;
+	case 0x09: /* сообщаем статус станции */
+		Frame[3]=VER;
+		STEP=0;
+		break;
+	default:
+		Frame[2]=0x01;
+		break;
+	}
+	Frame[4]=Calc_CS();/* Записываем контрольную сумму в ответный пакет */
+	Send_Frame();/* Отправка пакета */
+	Time(10);
+} 
+  
+
+void main(void)
+{
+	StartInit();
+	/* основной цикл */   
+	while(1)
+	{
+		Frame_Get();
+		Monitor();
+	}
+}  
+
+
+ 
